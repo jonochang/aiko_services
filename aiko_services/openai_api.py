@@ -4,11 +4,11 @@
 # ~~~~~
 # export AIKO_LOG_LEVEL=DEBUG
 # export AIKO_LOG_MQTT=false
-# ./storage.py start
+# ./openai_api.py start
 #
-# ./storage.py test_command
+# ./openai_api.py test_command
 #   Command: test_command(hello)
-# ./storage.py test_request request_0
+# ./openai_api.py test_request request_0
 #   Response: [("request_0", [])]
 #
 # To Do
@@ -21,22 +21,24 @@
 from abc import abstractmethod
 import click
 import sqlite3
+import openai
+import os
 
 from aiko_services import *
 from aiko_services.transport import *
 from aiko_services.utilities import *
 
-ACTOR_TYPE = "storage_manager"
+ACTOR_TYPE = "openai_api_manager"
 PROTOCOL = f"{ServiceProtocol.AIKO}/{ACTOR_TYPE}:0"
 
 _LOGGER = aiko.logger(__name__)
-_TOPIC_RESPONSE = f"{aiko.topic_out}/storage_response"
+_TOPIC_RESPONSE = f"{aiko.topic_out}/openai_api_response"
 _VERSION = 0
 
 # --------------------------------------------------------------------------- #
 
-class StorageManager(Actor):
-    Interface.implementations["StorageManager"] = "__main__.StorageManagerImpl"
+class OpenaiApiManager(Actor):
+    Interface.implementations["OpenaiApiManager"] = "__main__.OpenaiApiManagerImpl"
 
     @abstractmethod
     def test_command(self, parameter):
@@ -46,7 +48,11 @@ class StorageManager(Actor):
     def test_request(self, topic_path_response, request):
         pass
 
-class StorageManagerImpl(StorageManager):
+    @abstractmethod
+    def prompt(self, topic_path_response, request):
+        pass
+
+class OpenaiApiManagerImpl(OpenaiApiManager):
     def __init__(self,
         implementations, name, protocol, tags, transport, database_pathname):
 
@@ -74,6 +80,10 @@ class StorageManagerImpl(StorageManager):
         print(f"Command: test_command({parameter})")
 
     def test_request(self, topic_path_response, request):
+        aiko.message.publish(topic_path_response, "(item_count 1)")
+        aiko.message.publish(topic_path_response, f"({request})")
+
+    def prompt(self, topic_path_response, request):
         aiko.message.publish(topic_path_response, "(item_count 1)")
         aiko.message.publish(topic_path_response, f"({request})")
 
@@ -122,6 +132,28 @@ def do_request(actor_interface, request_handler, response_handler):  # Refactor
     aiko.process.add_message_handler(topic_response_handler, _TOPIC_RESPONSE)
     do_command(actor_interface, request_handler, terminate=False)
 
+def do_prompt(actor_interface, request_handler, response_handler):  # Refactor
+    def topic_response_handler(_aiko, topic, payload_in):
+        global item_count, items_received, response
+
+        command, parameters = parse(payload_in)
+        if command == "item_count" and len(parameters) == 1:
+            item_count = int(parameters[0])
+            items_received = 0
+            response = []
+        elif items_received < item_count:
+            openai.api_key = os.environ.get('OPENAI_API_KEY')
+            completion = openai.Completion.create(model="text-davinci-003", prompt=command, max_tokens=120, temperature=0, top_p=1, stream=False, echo=False, stop=None, frequency_penalty=0, presence_penalty=1, best_of=1)
+
+            response.append(("openai prompt", command, "completion:", completion.choices[0].text))
+            items_received += 1
+            if items_received == item_count:
+                response_handler(response)
+
+    aiko.process.add_message_handler(topic_response_handler, _TOPIC_RESPONSE)
+    do_command(actor_interface, request_handler, terminate=False)
+
+
 def waiting_timer():
     event.remove_timer_handler(waiting_timer)
     print(f"Waiting for {ACTOR_TYPE}")
@@ -130,19 +162,19 @@ def waiting_timer():
 def main():
     pass
 
-@main.command(help="Start StorageManager")
-@click.argument("database_pathname", default="aiko_storage.db")
+@main.command(help="Start OpenaiApiManager")
+@click.argument("database_pathname", default="aiko_openai_api.db")
 def start(database_pathname):
     tags = ["ec=true"]
     init_args = actor_args(ACTOR_TYPE, PROTOCOL, tags)
     init_args["database_pathname"] = database_pathname
-    storage_manager = compose_instance(StorageManagerImpl, init_args)
-    storage_manager.run()
+    openai_api_manager = compose_instance(OpenaiApiManagerImpl, init_args)
+    openai_api_manager.run()
 
 @main.command(name="test_command")
 def test_command():
-    do_command(StorageManager, lambda storage_manager:
-        storage_manager.test_command("hello")
+    do_command(OpenaiApiManager, lambda openai_api_manager:
+        openai_api_manager.test_command("hello")
     )
 
 @main.command(name="test_request")
@@ -152,9 +184,23 @@ def test_request(request):
         print(f"Response: {response}")
         import time; time.sleep(1)
 
-    do_request(StorageManager,
-        lambda storage_manager:
-            storage_manager.test_request(_TOPIC_RESPONSE, request),
+    do_request(OpenaiApiManager,
+        lambda openai_api_manager:
+            openai_api_manager.test_request(_TOPIC_RESPONSE, request),
+        response_handler
+    )
+
+@main.command(name="prompt")
+@click.argument("request")
+def prompt(request):
+    #print(f"prompt:...", response)
+    def response_handler(response):
+        print(f"Completion: {response}")
+        import time; time.sleep(1)
+
+    do_prompt(OpenaiApiManager,
+        lambda openai_api_manager:
+            openai_api_manager.test_request(_TOPIC_RESPONSE, request),
         response_handler
     )
 
